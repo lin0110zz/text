@@ -2671,11 +2671,17 @@
       for (let i = 0; i < allSongs.length; i++) {
         if (allSongs[i]._uid === songId) return i;
       }
-      // 构造播放地址：带来源与歌名/歌手，供后端跨平台兜底
-      let playUrl = (API_BASE || "") + "/api/play?id=" + encodeURIComponent(song.id) +
-        "&source=" + encodeURIComponent(source);
-      if (song.name) playUrl += "&name=" + encodeURIComponent(song.name);
-      if (song.artist) playUrl += "&artist=" + encodeURIComponent(song.artist);
+      // 构造播放地址：若已给出可直接播放的完整 URL（如 B站 BV 音频经云函数代理的 /api/bvaudio 地址），
+      // 则原样使用以支持二进制流与拖动；否则用带来源与歌名/歌手的 /api/play 供后端跨平台兜底。
+      let playUrl;
+      if (song.src && /^https?:\/\//i.test(song.src)) {
+        playUrl = song.src;
+      } else {
+        playUrl = (API_BASE || "") + "/api/play?id=" + encodeURIComponent(song.id) +
+          "&source=" + encodeURIComponent(source);
+        if (song.name) playUrl += "&name=" + encodeURIComponent(song.name);
+        if (song.artist) playUrl += "&artist=" + encodeURIComponent(song.artist);
+      }
       // 添加到allSongs
       const idx = allSongs.length;
       allSongs.push({
