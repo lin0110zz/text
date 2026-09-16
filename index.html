@@ -2607,8 +2607,8 @@
     updateModeIcon();
 
     /*========== 搜索 & 歌单系统 ==========*/
-    // 后端API地址（腾讯云SCF函数URL，国内可访问；酷我音源代理）
-    const API_BASE = "https://1489001692-hrizux5309.ap-guangzhou.tencentscf.com";
+    // 后端API地址（腾讯云SCF Web函数URL，原生HTTP透传支持二进制音频流与Range；QQ/酷我音源 + B站BV音频代理）
+    const API_BASE = "https://1489001692-hcdmisltcl.ap-guangzhou.tencentscf.com";
 
     // 歌单数据：默认歌单是原5首本地歌曲
     let userPlaylists = {

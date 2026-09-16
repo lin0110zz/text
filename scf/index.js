@@ -48,6 +48,129 @@ function toHttps(u) {
   return String(u || '').replace(/^http:\/\//i, 'https://');
 }
 
+// 二进制 HTTP/HTTPS 请求（音频流代理专用：以 Buffer 收集，避免字符串拼接损坏二进制）
+// 自动跟随最多 3 次重定向并保留请求头（如 Range）。
+function httpsRequestBuffer(url, options = {}, redirectsLeft = 3) {
+  return new Promise((resolve, reject) => {
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch (e) { return reject(e); }
+    const lib = parsedUrl.protocol === 'https:' ? https : http;
+    const reqOptions = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+    };
+    const req = lib.request(reqOptions, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        resolve(httpsRequestBuffer(next, options, redirectsLeft - 1));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({
+        statusCode: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(chunks),
+      }));
+    });
+    req.on('error', reject);
+    req.setTimeout(options.timeout || UPSTREAM_TIMEOUT, () => req.destroy(new Error('上游请求超时')));
+    req.end();
+  });
+}
+
+// base64url 编解码（用于在代理 URL 中安全传递 B站媒体地址）
+function b64urlEncode(s) {
+  return Buffer.from(String(s)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(s) {
+  let t = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (t.length % 4) t += '=';
+  return Buffer.from(t, 'base64').toString('utf8');
+}
+
+// 仅允许转发到 B站官方媒体 CDN 主机，防止代理被当作开放转发器（SSRF）
+const MEDIA_HOST_RE = /(^|\.)(bilivideo\.com|bilivideo\.cn|akamaized\.net|mountaintoys\.cn)$/i;
+// 每次最多向上游请求的字节数（base64 后约 1.37MB，远低于函数响应体限制），浏览器凭 206 自动续传
+const MEDIA_CHUNK_BYTES = 1024 * 1024;
+
+// B站音频流代理：浏览器直连 B站 CDN 会因 Referer 防盗链返回 403，
+// 改由云函数携带正确 Referer 转发，并把媒体切成小的 Range 分片以规避响应体大小限制。
+async function handleBvAudio(event) {
+  const hdrs = {};
+  for (const k of Object.keys((event && event.headers) || {})) hdrs[k.toLowerCase()] = event.headers[k];
+
+  const fail = (code, msg) => ({
+    isBase64Encoded: false,
+    statusCode: code,
+    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ error: msg }),
+  });
+
+  const query = (event && (event.queryString || event.queryStringParameters)) || {};
+
+  let target = '';
+  try { target = b64urlDecode(query.u || ''); } catch (e) { target = ''; }
+  let targetUrl;
+  try { targetUrl = new URL(target); } catch (e) { return fail(400, 'bad u'); }
+  if (!MEDIA_HOST_RE.test(targetUrl.hostname)) return fail(403, 'host not allowed');
+
+  // 解析浏览器请求的 Range，并把范围限制在单个分片内。
+  let start = 0;
+  let end = null;
+  const m = /bytes=(\d*)-(\d*)/.exec(hdrs['range'] || '');
+  if (m) {
+    if (m[1]) start = parseInt(m[1], 10) || 0;
+    if (m[2]) end = parseInt(m[2], 10);
+  }
+  const upEnd = end === null ? start + MEDIA_CHUNK_BYTES - 1 : Math.min(end, start + MEDIA_CHUNK_BYTES - 1);
+
+  let up;
+  try {
+    up = await httpsRequestBuffer(target, {
+      headers: {
+        'User-Agent': UA,
+        'Referer': 'https://www.bilibili.com/',
+        'Range': `bytes=${start}-${upEnd}`,
+      },
+      timeout: UPSTREAM_TIMEOUT,
+    });
+  } catch (e) {
+    return fail(502, 'upstream fetch failed');
+  }
+
+  const outHeaders = {
+    ...CORS_HEADERS,
+    'Content-Type': 'audio/mp4',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+  };
+
+  let body = up.body;
+  let status = up.statusCode;
+  const cr = up.headers['content-range'];
+  if (cr) {
+    outHeaders['Content-Range'] = cr;
+  } else if (status === 200) {
+    // 上游忽略 Range 返回全量时，截断为单个分片并自行构造 206，保证响应体不超限。
+    const total = body.length;
+    body = body.slice(0, MEDIA_CHUNK_BYTES);
+    status = 206;
+    outHeaders['Content-Range'] = `bytes 0-${body.length - 1}/${total}`;
+  }
+
+  return {
+    isBase64Encoded: true,
+    statusCode: status,
+    headers: outHeaders,
+    body: body.toString('base64'),
+  };
+}
+
 // 清理歌名/歌手里的转义字符与 HTML 实体
 function cleanText(s) {
   if (!s) return '';
@@ -134,10 +257,13 @@ function scoreSong(song, kw) {
   return score;
 }
 
-exports.main_handler = async (event, context) => {
-  const path = event.path || event.requestContext?.path || event.rawPath || '/';
-  const method = event.httpMethod || event.requestContext?.httpMethod || event.requestContext?.http?.method || 'GET';
-  const query = event.queryString || event.queryStringParameters || {};
+// 统一路由：事件函数与 Web 函数共用。输入归一化的 event，返回集成响应对象。
+async function router(event) {
+  const ev = event || {};
+  const rc = ev.requestContext || {};
+  const path = ev.path || rc.path || ev.rawPath || (rc.http && rc.http.path) || '/';
+  const method = ev.httpMethod || rc.httpMethod || (rc.http && rc.http.method) || 'GET';
+  const query = ev.queryString || ev.queryStringParameters || {};
 
   if (method === 'OPTIONS') {
     return { isBase64Encoded: false, statusCode: 200, headers: CORS_HEADERS, body: '' };
@@ -149,8 +275,10 @@ exports.main_handler = async (event, context) => {
     return handlePlaylist(query);
   } else if (path.includes('/api/play') || path === '/play') {
     return handlePlay(query);
+  } else if (path.includes('/api/bvaudio') || path === '/bvaudio') {
+    return handleBvAudio(ev);
   } else if (path.includes('/api/bv') || path === '/bv') {
-    return handleBv(query);
+    return handleBv(query, ev);
   }
 
   return {
@@ -159,7 +287,10 @@ exports.main_handler = async (event, context) => {
     headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     body: JSON.stringify({ ok: true, version: 'v7-qq-search', path }),
   };
-};
+}
+
+// 事件函数入口（函数 URL / API 网关触发器）
+exports.main_handler = async (event, context) => router(event);
 
 /* ===================== 酷我（主音源） ===================== */
 
@@ -441,11 +572,19 @@ async function handlePlay(query) {
 
 // 仅处理公开、可直接播放的视频：通过 B站公开接口拿到首P的 DASH 音频轨。
 // 不绕过会员、付费、登录或其它访问限制；没有公开音轨时直接返回错误。
-async function handleBv(query) {
+async function handleBv(query, event) {
   const raw = String(query.bvid || query.bv || query.id || '').trim();
   const m = raw.match(/BV[0-9A-Za-z]{10}/i);
   const bvid = m ? m[0] : '';
   if (!bvid) return jsonResp(400, { error: '请输入正确的 BV 号或 B站视频链接' });
+
+  // 函数自身对外地址，用于把 B站音频直链包装成带 Referer 的代理地址
+  const evHdrs = (event && event.headers) || {};
+  const selfHost = evHdrs.Host || evHdrs.host || evHdrs.HOST || '1489001692-hrizux5309.ap-guangzhou.tencentscf.com';
+  const fwdProto = evHdrs['x-forwarded-proto'] || evHdrs['X-Forwarded-Proto'];
+  const isLocalHost = /^(localhost|127\.|192\.168\.|10\.|0\.0\.0\.0)/i.test(selfHost);
+  const selfProto = fwdProto || (isLocalHost ? 'http' : 'https');
+  const selfBase = `${selfProto}://${selfHost}`;
 
   try {
     const viewResp = await httpsRequest(
@@ -463,30 +602,42 @@ async function handleBv(query) {
       return jsonResp(404, { error: '没有找到可播放的视频分P' });
     }
 
-    // 先尝试取得可直接播放的视频文件（DURL）。如果上游不给合并文件，再退回 DASH 独立音轨。
-    const playUrl =
+    // ① 先请求 DURL 合并视频文件，供 FFmpeg 直接分离原音轨。
+    const durlApi =
       `https://api.bilibili.com/x/player/playurl?bvid=${encodeURIComponent(bvid)}` +
       `&cid=${encodeURIComponent(page.cid)}&fnval=0&fnver=0&fourk=0`;
-    const playResp = await httpsRequest(playUrl, {
+    const durlResp = await httpsRequest(durlApi, {
       headers: { 'User-Agent': UA, 'Referer': `https://www.bilibili.com/video/${bvid}/` },
       timeout: UPSTREAM_TIMEOUT,
     });
-    const play = JSON.parse(playResp.body || '{}');
-    const durl = play && play.data && Array.isArray(play.data.durl) ? play.data.durl[0] : null;
-    const videoUrl = durl && durl.url ? toHttps(durl.url) : '';
+    const durlJson = JSON.parse(durlResp.body || '{}');
+    const durlItem = durlJson && durlJson.data && Array.isArray(durlJson.data.durl) ? durlJson.data.durl[0] : null;
+    const videoUrl = durlItem && durlItem.url ? toHttps(durlItem.url) : '';
 
+    // ② 再请求 DASH 独立音频轨（云函数环境通常没有 FFmpeg，这是主要可用路径）。
     let audioUrl = '';
-    let pipeline = '';
-
-    // 取得独立 DASH 音频轨作为无转码兜底。
-    const dash = play && play.data && play.data.dash;
-    if (dash && Array.isArray(dash.audio)) {
-      const audio = dash.audio.find(a => a && (a.baseUrl || a.base_url));
-      audioUrl = audio ? toHttps(audio.baseUrl || audio.base_url) : '';
+    try {
+      const dashApi =
+        `https://api.bilibili.com/x/player/playurl?bvid=${encodeURIComponent(bvid)}` +
+        `&cid=${encodeURIComponent(page.cid)}&fnval=16&fnver=0&fourk=1`;
+      const dashResp = await httpsRequest(dashApi, {
+        headers: { 'User-Agent': UA, 'Referer': `https://www.bilibili.com/video/${bvid}/` },
+        timeout: UPSTREAM_TIMEOUT,
+      });
+      const dashJson = JSON.parse(dashResp.body || '{}');
+      const audios = dashJson && dashJson.data && dashJson.data.dash && Array.isArray(dashJson.data.dash.audio)
+        ? dashJson.data.dash.audio : [];
+      // 取码率最高的独立音频轨。
+      const best = audios
+        .filter(a => a && (a.baseUrl || a.base_url))
+        .sort((x, y) => (y.bandwidth || 0) - (x.bandwidth || 0))[0];
+      if (best) audioUrl = toHttps(best.baseUrl || best.base_url);
+    } catch (e) {
+      // DASH 请求失败时继续尝试 FFmpeg 路径。
     }
 
-    // 如果拿到了视频文件，尝试使用 FFmpeg 直接复制原音轨；输出较小才内联，
-    // 避免把超大的媒体文件塞进云函数 JSON 响应。失败则继续使用独立音轨。
+    // ③ 如果拿到了视频文件且环境装有 FFmpeg，优先直接复制原音轨；输出较小才内联，
+    // 避免把超大的媒体文件塞进云函数 JSON 响应。失败则使用 DASH 独立音轨。
     if (videoUrl) {
       try {
         const ff = await extractAudioInline(videoUrl, {
@@ -515,17 +666,19 @@ async function handleBv(query) {
       });
     }
 
-    pipeline = 'direct-audio';
+    // ④ B站 DASH 独立音频轨：B站 CDN 校验 Referer，浏览器直连会 403，
+    // 因此包装成云函数代理地址（携带正确 Referer 并分片转发），可直接放进 <audio> 播放。
+    const proxiedAudio = `${selfBase}/api/bvaudio?u=${b64urlEncode(audioUrl)}`;
     return jsonResp(200, {
       code: 1,
       bvid,
       cid: String(page.cid),
       title: cleanText(view.data.title || page.part || bvid),
       duration: Number(page.duration || 0),
-      audio: audioUrl,
-      format: 'DASH audio',
-      pipeline,
-      note: 'B站已提供独立音频轨时直接使用原音轨；不绕过访问限制。',
+      audio: proxiedAudio,
+      format: 'DASH audio (proxied)',
+      pipeline: 'direct-audio-proxy',
+      note: 'B站公开独立音频轨经云函数代理转发，已携带正确 Referer，支持拖动与续播；不绕过访问限制。',
     });
   } catch (e) {
     return jsonResp(502, { error: '获取B站公开音轨失败，请稍后重试', detail: e.message });
@@ -659,4 +812,61 @@ function jsonResp(statusCode, obj) {
     headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     body: JSON.stringify(obj),
   };
+}
+
+/* ===================== Web 函数 HTTP 服务 ===================== */
+// 当作为 Web 函数直接运行（node index.js）时启动常驻 HTTP 服务；
+// 平台直接透传 HTTP 请求/响应，因此能正确返回二进制音频流与 206 Range。
+// 事件函数入口 exports.main_handler 不受影响，同一份代码两种部署方式通用。
+if (require.main === module) {
+  const PORT = process.env.PORT || process.env.SCF_PORT || 9000;
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+
+      const u = new URL(req.url, 'http://localhost');
+      const queryString = {};
+      for (const [k, v] of u.searchParams) queryString[k] = v;
+
+      const event = {
+        httpMethod: req.method,
+        path: u.pathname,
+        rawPath: u.pathname,
+        queryString,
+        headers: req.headers, // Node 已统一为小写
+        body: rawBody || null,
+      };
+
+      const resp = await router(event);
+
+      res.statusCode = resp.statusCode || 200;
+      const hdrs = resp.headers || {};
+      for (const [k, v] of Object.entries(hdrs)) {
+        if (v === undefined || v === null) continue;
+        try { res.setHeader(k, v); } catch (e) { /* 忽略非法头部 */ }
+      }
+
+      const out = resp.isBase64Encoded
+        ? Buffer.from(resp.body == null ? '' : resp.body, 'base64')
+        : Buffer.from(resp.body == null ? '' : String(resp.body), 'utf8');
+      res.removeHeader('Content-Length');
+      res.setHeader('Content-Length', out.length);
+      res.end(out);
+    } catch (e) {
+      res.statusCode = 502;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: 'gateway error', detail: String((e && e.message) || e) }));
+    }
+  });
+
+  server.on('clientError', (err, socket) => {
+    try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (e) { /* noop */ }
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`lovezz-api web server listening on 0.0.0.0:${PORT}`);
+  });
 }
