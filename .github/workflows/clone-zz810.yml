@@ -1,0 +1,32 @@
+name: Initialize zz810 from lovezz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone zz810 source
+        run: |
+          git clone https://github.com/lin0110zz/lovezz.git source
+          rm -rf source/.git
+      - name: Publish zz810
+        run: |
+          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
+          rm -rf repo/.git
+          cp -a source/. repo/
+          cd repo
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Create zz810 from lovezz"
+          git branch -M main
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push --force origin main
