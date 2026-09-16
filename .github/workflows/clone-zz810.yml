@@ -1,4 +1,4 @@
-name: Initialize zz810 from lovezz
+name: Clone zz810 from lovezz
 
 on:
   push:
@@ -12,21 +12,22 @@ jobs:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - name: Clone zz810 source
+      - name: Clone source project
+        run: git clone --depth 1 https://github.com/lin0110zz/lovezz.git source
+      - name: Replace target with zz810 copy
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git clone https://github.com/lin0110zz/lovezz.git source
-          rm -rf source/.git
-      - name: Publish zz810
-        run: |
-          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
-          rm -rf repo/.git
-          cp -a source/. repo/
-          cd repo
+          rm -rf target
+          mkdir target
+          cp -a source/. target/
+          rm -rf target/.git
+          cd target
           git init
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Create zz810 from lovezz"
+          git commit -m "Create zz810 copy from lovezz"
           git branch -M main
-          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin main
