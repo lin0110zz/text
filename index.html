@@ -2835,7 +2835,7 @@
       const idx = findOrAddSearchSong(currentBvAudioSong);
       if (playlist.indexOf(idx) === -1) playlist.push(idx);
       renderPlaylist();
-      saveUserPlaylists();
+      savePlaylists();
       showToast("已加入 zz 的播放列表");
     }
 
@@ -2848,7 +2848,7 @@
       const idx = findOrAddSearchSong(currentBvAudioSong);
       if (playlist.indexOf(idx) === -1) playlist.push(idx);
       renderPlaylist();
-      saveUserPlaylists();
+      savePlaylists();
       switchAudio(playlist.indexOf(idx));
       closeSearchPanel();
     });
