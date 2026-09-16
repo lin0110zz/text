@@ -1,0 +1,58 @@
+name: Enable ZZ dynamic background
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  inject-script:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Inject dynamic background scripts
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('index.html')
+          text = p.read_text(encoding='utf-8')
+
+          tags = [
+              '<script src="zz-dynamic.js"></script>',
+              '<script src="zz-featured.js"></script>',
+              '<script src="zz-ui.js"></script>'
+          ]
+
+          marker = '</body>'
+          if marker not in text:
+              raise SystemExit('index.html does not contain </body>')
+
+          for tag in tags:
+              if tag not in text:
+                  text = text.replace(marker, '  ' + tag + '\n' + marker, 1)
+                  print('Injected', tag)
+              else:
+                  print('Already enabled:', tag)
+
+          p.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "No changes needed"
+            exit 0
+          fi
+          git commit -m "chore: enable floating background and add-song UI [skip ci]"
+          git push
